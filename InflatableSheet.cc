@@ -1,4 +1,5 @@
 #include "InflatableSheet.hh"
+#include "MeshFEM/unused.hh"
 
 #include <MeshFEM/MSHFieldWriter.hh>
 #include <MeshFEM/ParallelAssembly.hh>
@@ -61,6 +62,36 @@ InflatableSheet::InflatableSheet(const std::shared_ptr<Mesh> &inMesh, const std:
 
     setIdentityDeformation();
     m_updateMaterialProperties();
+    m_updateGravityCache();
+
+    {
+        // Pick "c" and place it at the origin.
+        int c_idx;
+        // get the center of mass of the mesh
+        V3d cm = V3d::Zero();
+        for (const auto v : m.vertices()) {
+            cm += v.node()->p;
+        }
+        cm /= m.numVertices();
+        // find the index of the vertex closest to the center of mass that's not a fuse vertex.
+        Real curr_dist = std::numeric_limits<Real>::max();
+        for (const auto v : m.vertices()) {
+            if (m_fusedVtx[v.index()]) continue;
+            if ((v.node()->p - cm).norm() < curr_dist) {
+                curr_dist = (v.node()->p - cm).norm();
+                c_idx = v.index();
+            }
+        }
+        // use varIdx to compute the variable indices corresponding to the vertex c_idx in the top sheet for all x, y, z components.
+        m_center_non_fused_vx_idx = varIdx(0, c_idx, 0) / 3;
+    }
+
+    m_fusingPolylines = computeFusingPolylines();
+}
+
+InflatableSheet::InflatableSheet(const std::shared_ptr<Mesh> &inMesh, const std::vector<bool> &fusedVtx, const FusingPolylines &fusingPolylines) : InflatableSheet(inMesh, fusedVtx) {
+    m_fusingPolylines = fusingPolylines;
+    m_using_single_fusing_line = true;
 }
 
 void InflatableSheet::m_updateB() {
@@ -104,6 +135,7 @@ void InflatableSheet::setVars(Eigen::Ref<const VXd> vars) {
     m_triEnergyDensity.resize(2 * nt);
     m_BtGradLambda.resize(2 * nt);
     m_deformed_normals.resize(3, 2 * nt);
+    m_deformed_normals_scaled_by_areas.resize(3, 2 * nt);
     m_deformed_areas  .resize(2 * nt);
 
     m_projectedTriEnergyDensity.resize(2 * nt);
@@ -131,6 +163,7 @@ void InflatableSheet::setVars(Eigen::Ref<const VXd> vars) {
             const Real dblA = n.norm();
             m_deformed_areas[sheet_tri_idx] = 0.5 * dblA;
             m_deformed_normals.col(sheet_tri_idx) = (normalSign / dblA) * n;
+            m_deformed_normals_scaled_by_areas.col(sheet_tri_idx) = 0.5 * normalSign * n;
         }
     };
 
@@ -199,26 +232,6 @@ void InflatableSheet::setUninflatedDeformation(M3Xd P /* copy modified inside */
     setVars(vars);
 }
 
-// Neumaier sum adapted from Wikipedia
-template<typename T>
-struct NeumaierSum {
-    NeumaierSum(T val = 0) : sum(val) { }
-
-    void accumulate(T term) {
-        T newSum = sum + term;
-        if (std::abs(sum) >= std::abs(term))
-            c += term  + (sum - newSum); // If sum is bigger, low-order digits of "term" are lost.
-        else
-            c += sum + (term - newSum);  // Else low-order digits of sum are lost
-        sum = newSum;
-    }
-
-    T result() {  return sum + c; }
-
-    T c = 0; // roundoff error correction
-    T sum = 0;
-};
-
 // enclosed volume
 InflatableSheet::Real InflatableSheet::volume() const {
     Real vol_6 = 0;
@@ -228,7 +241,7 @@ InflatableSheet::Real InflatableSheet::volume() const {
     // center our volume calculation around it to reduce floating point cancellation.
     vol_6 = -6 * m_referenceVolume;
 
-    NeumaierSum<Real> sum(vol_6);
+    InflatableSheet::NeumaierSum<Real> sum(vol_6);
 
     for (const auto tri : mesh().elements()) {
         if (m_airChannelForTri[tri.index()] == 0) continue; // only boundaries of the air channels feel pressure
@@ -264,17 +277,34 @@ InflatableSheet::Real InflatableSheet::energyPressurePotential() const {
     return -(volume() - m_referenceVolume) * m_pressure;
 }
 
-InflatableSheet::VXd InflatableSheet::gradientPressurePotential() const {
+InflatableSheet::VXd InflatableSheet::gradientPressurePotential(bool handleOpenBoundary) const {
     VXd result(VXd::Zero(numVars()));
 
-    for (size_t sheetIdx = 0; sheetIdx < 2; ++sheetIdx) {
+    for (int sheetIdx = 0; sheetIdx < 2; ++sheetIdx) {
         for (const auto tri : mesh().elements()) {
             if (m_airChannelForTri[tri.index()] == 0) continue; // only boundaries of the air channels feel pressure
-#if 1
+#if 1    
             const size_t sheet_tri_idx = sheetTriIdx(sheetIdx, tri.index());
-            V3d contrib = (-m_pressure * m_deformed_areas[sheet_tri_idx] / 3.0) * m_deformed_normals.col(sheet_tri_idx);
+            V3d contrib = (-m_pressure / 3.0) * m_deformed_normals_scaled_by_areas.col(sheet_tri_idx);
             for (const auto v : tri.vertices())
                 result.segment<3>(varIdx(sheetIdx, v.index())) += contrib;
+
+            if (handleOpenBoundary) {
+                // Need to handle boundary verties where the one ring is not complete.
+                // These are not computed if the flag is set to false by the caller where the boundary volumes are handled there. 
+                for (size_t i = 0; i < 3; ++i) {
+                    const auto edge = tri.halfEdge(i);
+                    if (edge.isBoundary()) {
+                        const size_t v0_idx = edge.boundaryEdge().node(0).volumeNode().index();
+                        const size_t v1_idx = edge.boundaryEdge().node(1).volumeNode().index();
+                        V3d bdryContrib = (-m_pressure) * (1 - sheetIdx * 2) * getDeformedVtxPosition(v0_idx, sheetIdx).cross(getDeformedVtxPosition(v1_idx, sheetIdx)) / 6.0; 
+                        result.segment<3>(varIdx(sheetIdx, v0_idx)) += bdryContrib; 
+                        result.segment<3>(varIdx(sheetIdx, v1_idx)) += bdryContrib;
+                    }
+                    
+                }
+            }
+
 #else // equivalent version derived more directly from the signed volume pressure potential
             const double normalSign = (sheetIdx == 0) ? 1.0 : -1.0;
             const double signed_pressure_div_6 = normalSign * m_pressure / 6.0;
@@ -293,7 +323,7 @@ InflatableSheet::VXd InflatableSheet::gradientPressurePotential() const {
 
 InflatableSheet::Real InflatableSheet::energy(EnergyType etype) const {
     BENCHMARK_START_TIMER_SECTION("InflatableSheet energy");
-    NeumaierSum<Real> sum;
+    InflatableSheet::NeumaierSum<Real> sum;
     if ((etype == EnergyType::Full) || (etype == EnergyType::Pressure))
         sum.accumulate(energyPressurePotential());
 
@@ -305,17 +335,20 @@ InflatableSheet::Real InflatableSheet::energy(EnergyType etype) const {
             }
         }
     }
+    if ((etype == EnergyType::Full) || (etype == EnergyType::Gravity))
+        sum.accumulate(m_g_grad.dot(getVars()));
+
     BENCHMARK_STOP_TIMER_SECTION("InflatableSheet energy");
 
     return sum.result();
 }
 
-InflatableSheet::VXd InflatableSheet::gradient(EnergyType etype) const {
+InflatableSheet::VXd InflatableSheet::gradient(EnergyType etype, bool handleOpenBoundary) const {
     BENCHMARK_START_TIMER_SECTION("InflatableSheet gradient");
     VXd result(VXd::Zero(numVars()));
 
     if ((etype == EnergyType::Full) || (etype == EnergyType::Pressure))
-        result += gradientPressurePotential();
+        result += gradientPressurePotential(handleOpenBoundary);
 
     if ((etype == EnergyType::Full) || (etype == EnergyType::Elastic)) {
         auto accumulatePerTriContrib = [this](size_t tri_idx, VXd &out) {
@@ -337,6 +370,9 @@ InflatableSheet::VXd InflatableSheet::gradient(EnergyType etype) const {
         for (size_t i = 0; i < ntri; ++i)
             accumulatePerTriContrib(i, result);
     }
+
+    if ((etype == EnergyType::Full) || (etype == EnergyType::Gravity))
+        result += m_g_grad;
 
     BENCHMARK_STOP_TIMER_SECTION("InflatableSheet gradient");
 
@@ -419,24 +455,22 @@ SuiteSparseMatrix InflatableSheet::hessian(EnergyType etype) const {
 }
 
 void InflatableSheet::hessian(SuiteSparseMatrix &H, EnergyType etype) const {
-    auto assemblePerTriContrib = [&](const size_t ti, SuiteSparseMatrix &Hout) {
+    BENCHMARK_SCOPED_TIMER_SECTION timer("InflatableSheet.hessian");
+    auto &varLocks = m_getVarLocks();
+    auto assemblePerTriContrib = [&](const size_t ti) {
         const auto &tri = mesh().element(ti);
         for (size_t sheetIdx = 0; sheetIdx < 2; ++sheetIdx) {
             const size_t sheet_tri_idx = sheetTriIdx(sheetIdx, tri.index());
+            Eigen::Matrix<Real, 9, 9> elemH;
+            elemH.setZero();
 
             if ((etype == EnergyType::Full) || (etype == EnergyType::Pressure)) {
                 M3d triCornerPos;
                 const double normalSign = (sheetIdx == 0) ? 1.0 : -1.0;
                 const double signed_pressure_div_6 = normalSign * m_pressure / 6.0;
                 getDeformedTriCornerPositions(tri.index(), sheetIdx, triCornerPos);
-                for (    const auto v_b : tri.vertices()) {
-                    for (const auto v_a : tri.vertices()) {
-                        size_t a = varIdx(sheetIdx, v_a.index(), 0),
-                               b = varIdx(sheetIdx, v_b.index(), 0);
-                        if (a >= b) continue; // strict upper triangle only (no vertex self-interaction)
-
-                        const size_t vla = v_a.localIndex();
-                        const size_t vlb = v_b.localIndex();
+                for (size_t vlb = 0; vlb < 3; ++vlb) {
+                    for (size_t vla = 0; vla < vlb; ++vla) { // strict upper triangle only (no vertex self-interaction)
                         // Gradient wrt v1 of a triangle's signed volume contribution is:
                         //      d vol / d v1 = v_2 x  v_3
                         // so differentiating again with respect to v_2 or v_3
@@ -446,12 +480,12 @@ void InflatableSheet::hessian(SuiteSparseMatrix &H, EnergyType etype) const {
                         const double ordering_sign = (vlb == ((vla + 1) % 3)) ? -1.0 : 1.0;
                         V3d contrib = (-signed_pressure_div_6 * ordering_sign) * triCornerPos.col(vlother);
 
-                        Hout.addNZ(a + 1, b + 0,  contrib[2]);
-                        Hout.addNZ(a + 2, b + 0, -contrib[1]);
-                        Hout.addNZ(a + 0, b + 1, -contrib[2]);
-                        Hout.addNZ(a + 2, b + 1,  contrib[0]);
-                        Hout.addNZ(a + 0, b + 2,  contrib[1]);
-                        Hout.addNZ(a + 1, b + 2, -contrib[0]);
+                        elemH(3 * vla + 1, 3 * vlb + 0) +=  contrib[2];
+                        elemH(3 * vla + 2, 3 * vlb + 0) += -contrib[1];
+                        elemH(3 * vla + 0, 3 * vlb + 1) += -contrib[2];
+                        elemH(3 * vla + 2, 3 * vlb + 1) +=  contrib[0];
+                        elemH(3 * vla + 0, 3 * vlb + 2) +=  contrib[1];
+                        elemH(3 * vla + 1, 3 * vlb + 2) += -contrib[0];
                     }
                 }
             }
@@ -461,29 +495,43 @@ void InflatableSheet::hessian(SuiteSparseMatrix &H, EnergyType etype) const {
                 // are contiguous.
                 const auto &BtGradLambda = m_BtGradLambda[sheet_tri_idx];
 
-                for (const auto v_b : tri.vertices()) {
-                    VSFJ vol_dF_b(0, tri->volume() * BtGradLambda.col(v_b.localIndex()));
-                    const size_t b = varIdx(sheetIdx, v_b.index(), 0);
+                for (size_t vlb = 0; vlb < 3; ++vlb) {
+                    VSFJ vol_dF_b(0, tri->volume() * BtGradLambda.col(vlb));
                     for (size_t comp_b = 0; comp_b < 3; ++comp_b) {
                         vol_dF_b.c = comp_b;
-                        M32d delta_de;
                         const bool useHPE = m_useHessianProjectedEnergy[sheet_tri_idx];
-                        if (useHPE) delta_de = m_projectedTriEnergyDensity[sheet_tri_idx].delta_denergy(vol_dF_b);
-                        else        delta_de =          m_triEnergyDensity[sheet_tri_idx].delta_denergy(vol_dF_b);
+                        M32d delta_de = useHPE ? m_projectedTriEnergyDensity[sheet_tri_idx].delta_denergy(vol_dF_b)
+                                               :          m_triEnergyDensity[sheet_tri_idx].delta_denergy(vol_dF_b);
 
-                        for (const auto v_a : tri.vertices()) {
-                            const size_t a = varIdx(sheetIdx, v_a.index(), 0);
-                            if (a > b) continue; // upper triangle only
-                            if (a == b) Hout.addNZStrip(a, b + comp_b, delta_de.topRows(comp_b + 1) * BtGradLambda.col(v_a.localIndex()));
-                            else        Hout.addNZStrip(a, b + comp_b, delta_de                     * BtGradLambda.col(v_a.localIndex()));
-                        }
+                        Eigen::Map<M3d>(elemH.col(3 * vlb + comp_b).data()) += delta_de * BtGradLambda;
                     }
+                }
+            }
+
+            elemH.triangularView<Eigen::StrictlyLower>() = elemH.triangularView<Eigen::StrictlyUpper>().transpose();
+
+            for (const auto v_b : tri.vertices()) {
+                size_t b = varIdx(sheetIdx, v_b.index(), 0);
+                for (size_t comp_b = 0; comp_b < 3; ++comp_b) {
+                    size_t col = b + comp_b;
+                    while (varLocks[col].exchange(true, std::memory_order_acquire)); // lock column
+                    for (const auto v_a : tri.vertices()) {
+                        size_t a = varIdx(sheetIdx, v_a.index(), 0);
+                        if (a > b) continue; // upper triangle only
+                        size_t len = std::min<size_t>(3, col - a + 1);
+                        int vlb = v_b.localIndex();
+                        int vla = v_a.localIndex();
+                        H.addNZStrip(a, col, elemH.col(3 * vlb + comp_b).middleRows(3 * vla, len));
+                    }
+                    varLocks[col].store(false, std::memory_order_release); // unlock column
                 }
             }
         }
     };
 
-    assemble_parallel(assemblePerTriContrib, H, mesh().numTris());
+    get_hessian_assembly_arena().execute([&assemblePerTriContrib, this]() {
+        parallel_for_range(mesh().numElements(), assemblePerTriContrib);
+    });
 }
 
 std::shared_ptr<InflatableSheet::Mesh> InflatableSheet::visualizationMesh(bool duplicateFusedTris) const {
@@ -617,8 +665,8 @@ void InflatableSheet::writeDebugMesh(const std::string &path) const {
     writer.addField("G-L Strain", strain, DomainType::PER_ELEMENT);
 }
 
-std::pair<std::vector<InflatableSheet::IdxPolyline>, std::vector<InflatableSheet::IdxPolyline>>
-InflatableSheet::getFusingPolylines() const {
+InflatableSheet::FusingPolylines
+InflatableSheet::computeFusingPolylines() const {
     std::pair<std::vector<InflatableSheet::IdxPolyline>, std::vector<InflatableSheet::IdxPolyline>> result;
     auto &boundaryLoops = result.first;
     auto &wallCurves = result.second;
@@ -689,6 +737,7 @@ InflatableSheet::getFusingPolylines() const {
             auto he = he_opp.opposite();
             if (isWallTri(he.tri().index())) continue;
             auto he_end = addCurveOriginatingWithHE(he);
+            UNUSED(he_end);
             assert(he_end.tip().isBoundary()); // We should have terminated at another boundary vertex...
         }
     }
@@ -699,6 +748,7 @@ InflatableSheet::getFusingPolylines() const {
         if (he.isBoundary() || visited[he.index()] || !isWallTri(he.opposite().tri().index())) continue;
         if (isWallTri(he.tri().index())) continue; // skip halfedges inside walls
         auto he_end = addCurveOriginatingWithHE(he);
+        UNUSED(he_end);
         assert(he_end == he); // We should have returned to the starting half edge
     }
 

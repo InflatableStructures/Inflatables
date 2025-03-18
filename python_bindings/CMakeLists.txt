@@ -27,3 +27,10 @@ set_target_properties(wall_generation PROPERTIES CXX_STANDARD 14)
 set_target_properties(wall_generation PROPERTIES CXX_STANDARD_REQUIRED ON)
 set_target_properties(wall_generation PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/python)
 target_link_libraries(wall_generation PUBLIC wallgen_lib intel_pybind_14_hack)
+
+
+# Create a `Inflation` python module that just sets the correct paths for
+# importing Inflation's individual pybind11 modules
+set(PYTHON_DEPLOY_DIR "${CMAKE_SOURCE_DIR}/python/Inflation")
+file(MAKE_DIRECTORY "${PYTHON_DEPLOY_DIR}")
+configure_file(${PROJECT_SOURCE_DIR}/python/init_template.py "${PYTHON_DEPLOY_DIR}/__init__.py")

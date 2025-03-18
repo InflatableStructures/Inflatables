@@ -156,7 +156,7 @@ PYBIND11_MODULE(inflation, m) {
         .def_property("youngModulus", &InflatableSheet::getYoungModulus, &InflatableSheet::setYoungModulus)
 
         .def("energy",   &InflatableSheet::energy  , py::arg("energyType") = IEType::Full)
-        .def("gradient", &InflatableSheet::gradient, py::arg("energyType") = IEType::Full)
+        .def("gradient", &InflatableSheet::gradient, py::arg("energyType") = IEType::Full, py::arg("handleOpenBoundary") = true)
 
         .def("hessianSparsityPattern", &InflatableSheet::hessianSparsityPattern, py::arg("val") = 1.0)
         .def("hessian",  py::overload_cast<IEType>(&InflatableSheet::hessian, py::const_), py::arg("energyType") = IEType::Full)
@@ -507,26 +507,6 @@ PYBIND11_MODULE(inflation, m) {
     ////////////////////////////////////////////////////////////////////////////////
     // Energy Densities
     ////////////////////////////////////////////////////////////////////////////////
-    using OTFE = OptionalTensionFieldEnergy<InflatableSheet::Real>;
-    using OTFE_M2d = OTFE::M2d;
-    py::class_<OTFE>(m, "OptionalTensionFieldEnergy")
-        .def(py::init<const OTFE_M2d &>())
-        .def(  "energy",         &OTFE::  energy)
-        .def( "denergy",         py::overload_cast<const OTFE_M2d &>(&OTFE::denergy, py::const_), py::arg("dC"))
-        .def( "denergy",         py::overload_cast<                >(&OTFE::denergy, py::const_))
-        .def("d2energy",         &OTFE::d2energy)
-        .def("tensionState",     &OTFE::tensionState)
-        .def("eigSensitivities", &OTFE::eigSensitivities)
-        .def("setMatrix", [](OTFE &tfe, OTFE_M2d &mat) { tfe.setMatrix(mat); })
-
-        .def("setEigs",   &OTFE::setEigs,   py::arg("l1"), py::arg("l2"))
-        .def("psi",       &OTFE::psi)
-        .def("dpsi_dl",   &OTFE::dpsi_dl)
-        .def("d2psi_dl2", &OTFE::d2psi_dl2)
-
-        .def_readwrite("useTensionField", &OTFE::useTensionField)
-        ;
-
     // Note: we cannot directly bind pointers to methods/memebers inherited from OptionalTensionFieldEnergy
     // (hence all the lambda functions).
     using OTFEJB = EnergyDensityFBasedFromCBased<OptionalTensionFieldEnergy<InflatableSheet::Real>, 3>;
@@ -546,13 +526,14 @@ PYBIND11_MODULE(inflation, m) {
         ;
 
     using IBE = IncompressibleBalloonEnergy<InflatableSheet::Real>;
+    using IBE_M2d = IBE::M2d;
     py::class_<IBE>(m, "IncompressibleBalloonEnergy")
         .def(py::init<>())
-        .def("setMatrix", [](IBE &psi, const OTFE_M2d &C) { psi.setMatrix(C); })
+        .def("setMatrix", [](IBE &psi, const IBE_M2d &C) { psi.setMatrix(C); })
         .def("energy",    &IBE::energy)
-        .def("denergy",   [](const IBE &psi) { return psi.denergy(); })
-        .def("delta_denergy",            [](const IBE &psi, const OTFE_M2d &dC) { return psi.delta_denergy(dC); })
-        .def("delta_denergy_undeformed", [](const IBE &psi, const OTFE_M2d &dC) { return psi.delta_denergy_undeformed(dC); })
+        .def("denergy",   [](const IBE &psi) { return psi.denergy_dC(); })
+        .def("delta_denergy",            [](const IBE &psi, const IBE_M2d &dC) { return psi.delta_denergy_dC(dC); })
+        .def("delta_denergy_undeformed", [](const IBE &psi, const IBE_M2d &dC) { return psi.delta_denergy_dC_undeformed(dC); })
         ;
 
     using IBEWHP = IncompressibleBalloonEnergyWithHessProjection<InflatableSheet::Real>;

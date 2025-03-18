@@ -24,13 +24,16 @@
 #include <MeshFEM/Utilities/MeshConversion.hh>
 #include <memory>
 #include <string>
+#include <atomic>
 
+#include <MeshFEM/EnergyDensities/NeoHookeanEnergy.hh>
 #include <MeshFEM/EnergyDensities/StVenantKirchhoff.hh>
 #include <MeshFEM/EnergyDensities/TensionFieldTheory.hh>
 #include <MeshFEM/EnergyDensities/TangentElasticityTensor.hh>
 #include <MeshFEM/EnergyDensities/IsoCRLETensionFieldMembrane.hh>
+#include <MeshFEM/EnergyDensities/TensionFieldNeoHookean.hh>
 
-#include "TensionFieldEnergy.hh"
+// #include "TensionFieldEnergy.hh"
 #include "IncompressibleBalloonEnergyWithHessProjection.hh"
 
 struct InflatableSheet {
@@ -73,12 +76,44 @@ struct InflatableSheet {
     using VSFJ = VectorizedShapeFunctionJacobian<3, V2d>;
     using ETensor = ElasticityTensor<Real, 2>;
 
+
+    // Neumaier sum adapted from Wikipedia
+    template<typename T>
+    struct NeumaierSum {
+        NeumaierSum(T val = 0) : sum(val) { }
+
+        void accumulate(T term) {
+            T newSum = sum + term;
+            if (std::abs(sum) >= std::abs(term))
+                c += term  + (sum - newSum); // If sum is bigger, low-order digits of "term" are lost.
+            else
+                c += sum + (term - newSum);  // Else low-order digits of sum are lost
+            sum = newSum;
+        }
+
+        T result() {  return sum + c; }
+
+        T c = 0; // roundoff error correction
+        T sum = 0;
+    };
+
     using Mesh = FEMMesh<2, 1, V3d>; // Piecewise linear triangle mesh embedded in R^3
-    enum class EnergyType { Full, Elastic, Pressure };
+
+    // Be careful when changing this since the periodic classes (InflatablePeriodicUnit and InflateableMidSurfacePeriodicUnit) also uses these.
+    enum class EnergyType { Full, Elastic, Pressure, Gravity };
 
     // Build from a triangle mesh representing the "top" sheet.
     // The "bottom" sheet is an oppositely oriented copy.
     InflatableSheet(const std::shared_ptr<Mesh> &inMesh, const std::vector<bool> &fusedVtx = std::vector<bool>());
+
+    // Get the boundary (first) and interior (second) fusing curves as closed
+    // polylines, represented as a sequence of vertex indices.
+    using IdxPolyline = std::vector<size_t>;
+    using FusingPolylines =  std::pair<std::vector<IdxPolyline>, std::vector<IdxPolyline>>;
+    FusingPolylines computeFusingPolylines() const;
+    FusingPolylines getFusingPolylines() const { return m_fusingPolylines; }
+
+    InflatableSheet(const std::shared_ptr<Mesh> &inMesh, const std::vector<bool> &fusedVtx, const FusingPolylines &fusingPolylines);
 
     void setMaterial(const EnergyDensity &psi) {
         for (auto &ted : m_triEnergyDensity)
@@ -113,12 +148,12 @@ struct InflatableSheet {
     // 6 variable pin constraints (subsequently accessed by rigidMotionPinVars()).
     // If "prepareRigidMotionPinConstraints" is false, then the unmodified P is used,
     // but rigid motion pin constraints are not set up.
-    void setUninflatedDeformation(M3Xd P /* copy modified inside */, bool prepareRigidMotionPinConstraints = true);
-    void setIdentityDeformation() {
+    void setUninflatedDeformation(M3Xd P /* copy modified inside */, bool prepareRigidMotionPinConstraints = false);
+    void setIdentityDeformation(bool prepareRigidMotionPinConstraints = false) {
         M3Xd P(3, mesh().numVertices());
         for (const auto v : mesh().vertices())
             P.col(v.index()) = v.node()->p.cast<Real>();
-        setUninflatedDeformation(P);
+        setUninflatedDeformation(P, prepareRigidMotionPinConstraints);
     }
 
     void setUseTensionFieldEnergy(bool useTFE) {
@@ -181,6 +216,11 @@ struct InflatableSheet {
     Real getThickness()    const { return m_thickness; }
     Real getYoungModulus() const { return m_youngModulus; }
 
+    void setRho (Real rho) { m_g_rho  = rho; m_updateGravityCache(); }
+    void setGravity (const V3d &g) { m_g = g; m_updateGravityCache(); }
+    Real getRho () const { return m_g_rho; }
+    const V3d &getGravity () const { return m_g; }
+
     // Volume enclosed by the sheet's tubes
     Real volume() const;
     Real referenceVolume() const { return m_referenceVolume; }
@@ -189,8 +229,10 @@ struct InflatableSheet {
     Real energy(EnergyType etype = EnergyType::Full) const;
     Real energyPressurePotential() const;
 
-    VXd gradientPressurePotential() const;
-    VXd gradient(EnergyType etype = EnergyType::Full) const;
+    Real systemEnergy() const { return energy(EnergyType::Elastic); }
+
+    VXd gradientPressurePotential(bool handleOpenBoundary = true) const;
+    VXd gradient(EnergyType etype = EnergyType::Full, bool handleOpenBoundary = true) const;
 
     size_t hessianNNZ() const { return hessianSparsityPattern().nz; } // TODO: predict without constructing
     SuiteSparseMatrix hessianSparsityPattern(Real val = 0.0) const;
@@ -389,11 +431,6 @@ struct InflatableSheet {
 
     void writeDebugMesh(const std::string &path) const;
 
-    // Get the boundary (first) and interior (second) fusing curves as closed
-    // polylines, represented as a sequence of vertex indices.
-    using IdxPolyline = std::vector<size_t>;
-    std::pair<std::vector<IdxPolyline>, std::vector<IdxPolyline>> getFusingPolylines() const;
-
     // Helper routines for serialization/restore
     using MaterialConfiguration = std::tuple<Real, // m_triEnergyDensity          stiffness
                                              bool, // m_triEnergyDensity          useTensionField
@@ -402,8 +439,8 @@ struct InflatableSheet {
     std::vector<MaterialConfiguration> getMaterialConfiguration() const {
         std::vector<MaterialConfiguration> result;
         const size_t nst = numSheetTris();
-        assert(m_triEnergyDensity.size() == nst);
-        assert(m_projectedTriEnergyDensity.size() == nst);
+        if (m_triEnergyDensity.size() != nst) throw std::runtime_error("Material configuration size mismatch - triEnergyDensity");
+        if (m_projectedTriEnergyDensity.size() != nst) throw std::runtime_error("Material configuration size mismatch - projectedTriEnergyDensity");
         for (size_t i = 0; i < nst; ++i) {
             result.emplace_back(m_triEnergyDensity[i].stiffness(), m_triEnergyDensity[i].getRelaxationEnabled(),
                                 m_projectedTriEnergyDensity[i].stiffness, m_projectedTriEnergyDensity[i].applyHessianProjection);
@@ -424,6 +461,11 @@ struct InflatableSheet {
 
     const std::vector<M32d> &getJB() const { return m_JB; }
 
+    size_t center_non_fused_vx_idx() const { return m_center_non_fused_vx_idx; }
+
+    bool using_single_fusing_line() const { return m_using_single_fusing_line; }
+    void set_using_single_fusing_line(bool val) { m_using_single_fusing_line = val; }
+    
 private:
     size_t m_numReducedVertices;
     Eigen::Matrix<int, Eigen::Dynamic, 2> m_reducedVtxForVertex;
@@ -439,6 +481,32 @@ private:
     Real m_pressure = 0.0; // current inflation pressure
     Real m_referenceVolume = 0.0; // V_0 used for defining the pressure potential.
     Real m_thickness = 0.075, m_youngModulus = 300; // Material properties used to set the energy density stiffness.
+
+    // Gravity
+    Real m_g_rho = 0.0; // mass density of the sheet
+    V3d m_g = V3d(0.0, 0.0, -9.80635);
+    VXd m_g_grad;
+
+    FusingPolylines m_fusingPolylines;
+    bool m_using_single_fusing_line = false;
+
+    void m_updateGravityCache() {
+        VXd result;
+        result.setZero(numVars());
+        const auto &m = mesh();
+        auto integratedPhis = integratedShapeFunctions<1, 2>();
+        for (const auto e : m.elements()) {
+            for (const auto n : e.nodes()) {
+                auto vi_top = varIdx(0, n.index(), 0);
+                auto vi_bot = varIdx(1, n.index(), 0);
+                auto contrib = m_g * (integratedPhis[n.localIndex()] * e->volume());
+                result.template segment<3>(vi_top) += contrib;
+                result.template segment<3>(vi_bot) += contrib;
+            }
+        }
+        result *= -m_g_rho;
+        m_g_grad = result;
+    }
 
     // Set all energy densities' stiffness parameters based on the thickness,
     // Young's modulus parameters configured for this sheet.
@@ -456,6 +524,7 @@ private:
 
     // Method to update the tangent space basis for each triangle (call when rest positions change)
     void m_updateB();
+    
 
     ////////////////////////////////////////////////////////////////////////////
     // Quantities computed from the current deformation
@@ -465,6 +534,7 @@ private:
     std::vector<M32d> m_JB;
     std::vector<M3d > m_J;  // mapping from 3D to 3D (with J n = 0)
     std::vector<M23d> m_BtGradLambda;
+    M3Xd m_deformed_normals_scaled_by_areas;
     M3Xd m_deformed_normals;
     VXd  m_deformed_areas;
 
@@ -473,6 +543,21 @@ private:
     aligned_std_vector<EnergyDensity> m_triEnergyDensity;
     aligned_std_vector<IncompressibleBalloonEnergyWithHessProjection<Real>> m_projectedTriEnergyDensity;
     std::vector<bool> m_useHessianProjectedEnergy;
+
+    size_t m_center_non_fused_vx_idx; 
+    
+
+    // Spin locks used for parallel Hessian assembly.
+    mutable std::unique_ptr<std::vector<std::atomic<bool>>> m_varLocks;
+    auto &m_getVarLocks() const {
+        if (!m_varLocks) {
+            const size_t nv = numVars();
+            m_varLocks = std::make_unique<std::vector<std::atomic<bool>>>(nv);
+            for (size_t i = 0; i < nv; ++i)
+                atomic_init(&(*m_varLocks)[i], false);
+        }
+        return *m_varLocks;
+    }
 };
 
 #endif /* end of include guard: INFLATABLESHEET_HH */
