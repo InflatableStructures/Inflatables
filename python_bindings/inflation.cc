@@ -68,10 +68,11 @@ PYBIND11_MODULE(inflation, m) {
     ////////////////////////////////////////////////////////////////////////////////
     // Free-standing functions
     ////////////////////////////////////////////////////////////////////////////////
-    m.def("inflation_newton", &inflation_newton<         InflatableSheet>, py::arg("isheet"),               py::arg("fixedVars"), py::arg("options") = NewtonOptimizerOptions(), py::arg("callback") = nullptr);
-    m.def("inflation_newton", &inflation_newton<TargetAttractedInflation>, py::arg("targetAttractedSheet"), py::arg("fixedVars"), py::arg("options") = NewtonOptimizerOptions(), py::arg("callback") = nullptr);
-    m.def("get_inflation_optimizer", &get_inflation_optimizer<         InflatableSheet>, py::arg("isheet"),               py::arg("fixedVars"), py::arg("options") = NewtonOptimizerOptions(), py::arg("callback") = nullptr);
-    m.def("get_inflation_optimizer", &get_inflation_optimizer<TargetAttractedInflation>, py::arg("targetAttractedSheet"), py::arg("fixedVars"), py::arg("options") = NewtonOptimizerOptions(), py::arg("callback") = nullptr);
+    m.def("inflation_newton", &inflation_newton<         InflatableSheet>, py::arg("isheet"),               py::arg("fixedVars"), py::arg("options") = NewtonOptimizerOptions(), py::arg("callback") = nullptr, py::arg("hessianShift") = 0.0, py::arg("systemEnergyIncreaseFactorLimit") = safe_numeric_limits<Real>::max(), py::arg("energyLimitingThreshold") = 1e-6);
+    m.def("inflation_newton", &inflation_newton<TargetAttractedInflation>, py::arg("targetAttractedSheet"), py::arg("fixedVars"), py::arg("options") = NewtonOptimizerOptions(), py::arg("callback") = nullptr, py::arg("hessianShift") = 0.0, py::arg("systemEnergyIncreaseFactorLimit") = safe_numeric_limits<Real>::max(), py::arg("energyLimitingThreshold") = 1e-6);
+
+    m.def("get_inflation_optimizer", &get_inflation_optimizer<         InflatableSheet>, py::arg("isheet"),               py::arg("fixedVars"), py::arg("options") = NewtonOptimizerOptions(), py::arg("callback") = nullptr, py::arg("hessianShift") = 0.0, py::arg("systemEnergyIncreaseFactorLimit") = safe_numeric_limits<Real>::max(), py::arg("energyLimitingThreshold") = 1e-6);
+    m.def("get_inflation_optimizer", &get_inflation_optimizer<TargetAttractedInflation>, py::arg("targetAttractedSheet"), py::arg("fixedVars"), py::arg("options") = NewtonOptimizerOptions(), py::arg("callback") = nullptr, py::arg("hessianShift") = 0.0, py::arg("systemEnergyIncreaseFactorLimit") = safe_numeric_limits<Real>::max(), py::arg("energyLimitingThreshold") = 1e-6);
 
     ////////////////////////////////////////////////////////////////////////////////
     // Inflatable Sheet
@@ -132,7 +133,7 @@ PYBIND11_MODULE(inflation, m) {
                 if (compIdx  > 3)                    throw std::runtime_error("compIdx  out of bounds");
                 return s.varIdx(sheetIdx, vtxIdx, compIdx);
         }, py::arg("sheetIdx"), py::arg("vtxIdx"), py::arg("compIdx") = 0)
-
+        .def("center_non_fused_vx_idx", &InflatableSheet::center_non_fused_vx_idx)
         .def("setUseTensionFieldEnergy",     &InflatableSheet::setUseTensionFieldEnergy)
         .def("setUseHessianProjectedEnergy", &InflatableSheet::setUseHessianProjectedEnergy)
         .def("setUseTensionFieldEnergy",     &InflatableSheet::setUseTensionFieldEnergy)
@@ -425,8 +426,8 @@ PYBIND11_MODULE(inflation, m) {
         ;
 
     pyReducedSheetOptimizer
-        .def(py::init<std::shared_ptr<TargetAttractedInflation>, const std::vector<size_t> &, const NewtonOptimizerOptions &, double, ReducedSheetOptimizer::VXd, const Mesh *>(),
-                py::arg("targetAttractedInflation"), py::arg("fixedVars") = std::vector<size_t>(), py::arg("eopts") = NewtonOptimizerOptions(), py::arg("detActivationThreshold") = 0.9,
+        .def(py::init<std::shared_ptr<TargetAttractedInflation>, const std::vector<size_t> &, const NewtonOptimizerOptions &, std::function<bool(size_t)>, double, double, ReducedSheetOptimizer::VXd, const Mesh *>(),
+                py::arg("targetAttractedInflation"), py::arg("fixedVars") = std::vector<size_t>(), py::arg("eopts") = NewtonOptimizerOptions(), py::arg("callback") = nullptr, py::arg("hessianShift") = 0.0, py::arg("detActivationThreshold") = 0.9,
                 py::arg("initialVars") = ReducedSheetOptimizer::VXd(),
                 py::arg("originalDesignMesh") = nullptr)
         .def("mesh",                     py::overload_cast<>(&ReducedSheetOptimizer::mesh),                py::return_value_policy::reference)
@@ -469,9 +470,10 @@ PYBIND11_MODULE(inflation, m) {
         .def_readwrite("useFirstOrderPrediction",  &ReducedSheetOptimizer::useFirstOrderPrediction)
         .def_readwrite("compressionPenaltyWeight", &ReducedSheetOptimizer::compressionPenaltyWeight)
 
-        .def("cloneForNewTAIAndFixedVars", &ReducedSheetOptimizer::cloneForNewTAIAndFixedVars, py::arg("tai"), py::arg("fv"))
+        .def("cloneForNewTAIAndFixedVars", &ReducedSheetOptimizer::cloneForNewTAIAndFixedVars, py::arg("tai"), py::arg("fv"), py::arg("hessianShift"))
         ;
     addSerializationBindings<ReducedSheetOptimizer, py::class_<ReducedSheetOptimizer>, ReducedSheetOptimizer::StateBackwardsCompat>(pyReducedSheetOptimizer);
+
 
     ////////////////////////////////////////////////////////////////////////////////
     // Analysis

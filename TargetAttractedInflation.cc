@@ -2,7 +2,7 @@
 
 #include <MeshFEM/ParallelAssembly.hh>
 
-TargetAttractedInflation::TargetAttractedInflation(std::shared_ptr<InflatableSheet> s, const Mesh &targetSurface)
+TargetAttractedInflation::TargetAttractedInflation(std::shared_ptr<InflatableSheet> s, const Mesh &targetSurface, const std::vector<bool>& wallVtxOnBoundary)
         : nondimensionalization(*s), m_sheet(s), m_targetSurfaceFitter(std::make_unique<TargetSurfaceFitter>(targetSurface))
 {
     const auto &m = mesh();
@@ -11,17 +11,37 @@ TargetAttractedInflation::TargetAttractedInflation(std::shared_ptr<InflatableShe
     // Area in the original (unoptimized) rest mesh. This is used for scaling the
     // vertex contributions to the fitting energy.
     VXd vertexArea(VXd::Zero(nv));
-    for (const auto &e : m.elements())
-        for (const auto &v : e.vertices())
-            vertexArea[v.index()] += e->volume() / 3.0;
+    if (s->using_single_fusing_line()) {
+        // if using single fusing lines, use the sum of 1/2 of incident fused edges' lengths as the area of the vertex.
+        for (auto he : s->mesh().halfEdges()) {
+            size_t v1 = he.tip().index();
+            size_t v2 = he.tail().index();
+            if (s->isWallVtx(v1) && s->isWallVtx(v2)) {
+                vertexArea(v1) += 0.5 * (he.tip().node()->p - he.tail().node()->p).norm();
+                vertexArea(v2) += 0.5 * (he.tip().node()->p - he.tail().node()->p).norm();
+            }
+        }
+    } else {
+        for (const auto &e : m.elements())
+            for (const auto &v : e.vertices())
+                vertexArea[v.index()] += e->volume() / 3.0;
+    }
 
     const auto &wallVtxs = sheet().wallVertices();
-    m_wallVtxOnBoundary.resize(wallVtxs.size());
-    VXd queryPtArea(wallVtxs.size());
-    for (size_t i = 0; i < wallVtxs.size(); ++i) {
-        m_wallVtxOnBoundary[i] = m.vertex(wallVtxs[i]).isBoundary();
-        queryPtArea[i] = vertexArea[wallVtxs[i]];
+    if (wallVtxOnBoundary.size() != wallVtxs.size()) {
+        m_wallVtxOnBoundary.resize(wallVtxs.size());
+        for (size_t i = 0; i < wallVtxs.size(); ++i) {
+            m_wallVtxOnBoundary[i] = m.vertex(wallVtxs[i]).isBoundary();
+        }
+    } else {
+        std::cout<<"Using provided wallVtxOnBoundary\n";
+        // There could be internal holes that are not boundary features but rather in fusing patterns. We don't want boundary attraction forces for those vertices because these holes are not in the target surface.
+        m_wallVtxOnBoundary = wallVtxOnBoundary;
     }
+    VXd queryPtArea(wallVtxs.size());
+    for (size_t i = 0; i < wallVtxs.size(); ++i)
+        queryPtArea[i] = vertexArea[wallVtxs[i]];
+
     m_targetSurfaceFitter->setQueryPtWeights(queryPtArea);
 
     m_targetSurfaceFitter->updateClosestPoints(sheet().deformedWallVertexPositions(), m_wallVtxOnBoundary);

@@ -31,6 +31,7 @@
 #include <MeshFEM/ParallelAssembly.hh>
 #include <memory>
 
+
 // variables: equilibrium vars (deformed positions), followed by
 //            design parameters (rest positions)
 struct ReducedSheetOptimizer {
@@ -50,6 +51,8 @@ struct ReducedSheetOptimizer {
     using CB  = CollapseBarrier<CollapsePreventionEnergySV>;
     using WPI = WallPositionInterpolator<Real>;
 
+    using CallbackFunction = std::function<bool(size_t)>;
+
     // Construct a view accessing the wall rest positions from the vector of
     // variables.
     template<typename Vector>
@@ -65,8 +68,10 @@ struct ReducedSheetOptimizer {
     // permitted by each stage cannot accumulate).
     // Note: the WallPositionInterpolator is rebuilt for the current design mesh. However, this should produce the same
     // sheet mesh (up to roundoff error) since the FEM Laplacian of the coordinate function on a planar mesh is 0.
-    ReducedSheetOptimizer(std::shared_ptr<TargetAttractedInflation> tai, const std::vector<size_t> &fixedVars, const NewtonOptimizerOptions &eopts = NewtonOptimizerOptions(), double detActivationThreshold = 0.9,
-                          VXd initialVars = VXd(), const Mesh *originalDesignMesh = nullptr /* ownership not transferred; copy is made */)
+    ReducedSheetOptimizer(std::shared_ptr<TargetAttractedInflation> tai, const std::vector<size_t> &fixedVars, const NewtonOptimizerOptions &eopts = NewtonOptimizerOptions(), 
+                        CallbackFunction customCallback = nullptr, Real hessianShift = 0.0, 
+                        double detActivationThreshold = 0.9,
+                        VXd initialVars = VXd(), const Mesh *originalDesignMesh = nullptr /* ownership not transferred; copy is made */)
         : m_targetAttractedInflation(tai),
           m_smoothness(std::make_shared<FusingCurveSmoothness>(tai->sheet())), // Note: only uses the combinatorics of tai->sheet(), so we needn't use the originalDesignMesh
           m_wallPosInterp(std::make_shared<WPI>(tai->sheet()))
@@ -95,8 +100,9 @@ struct ReducedSheetOptimizer {
         m_committedRestPositions  = MX2d::Zero(numVertices(), 2);
         m_linesearchRestPositions = MX2d::Zero(numVertices(), 2);
 
+        hessian_shift = hessianShift;
         // Set up equilibrium solver
-        m_equilibriumSolver = get_inflation_optimizer(*m_targetAttractedInflation, fixedVars, eopts);
+        m_equilibriumSolver = get_inflation_optimizer(*m_targetAttractedInflation, fixedVars, eopts, customCallback, hessianShift);
 
         // Initialize remaining state
         bool success = setVars(getCommittedVars());
@@ -208,7 +214,7 @@ struct ReducedSheetOptimizer {
         ///////////////////////////////////////////////////////////////////////
         // Equilibrium update with first order prediction
         ///////////////////////////////////////////////////////////////////////
-        auto &solver = m_equilibriumSolver->solver;
+        auto &solver = m_equilibriumSolver->solver();
 
         // Evaluate 0th order prediction of equilibrium
         m_targetAttractedInflation->setVars(m_committedEquilibrium);
@@ -226,10 +232,8 @@ struct ReducedSheetOptimizer {
                     MX2d delta_X(numVertices(), 2);
                     m_wallPosInterp->interpolate(wallRestPositionsFromVariables(delta_vars), delta_X);
                     // Run first order prediction (using Taylor expansion around committed design)
-                    Eigen::VectorXd rhs = m_equilibriumSolver->removeFixedEntries(
-                            -apply_d2E_dxdX(delta_X).cast<double>()
-                        );
-                    VXd delta_x = m_equilibriumSolver->extractFullSolution(solver.solve(rhs)).cast<Real>();
+                    Eigen::VectorXd rhs = -apply_d2E_dxdX(delta_X);
+                    VXd delta_x = solver.solve(rhs).cast<Real>();
                     m_targetAttractedInflation->setVars(m_committedEquilibrium + delta_x);
                 }
 
@@ -305,7 +309,7 @@ struct ReducedSheetOptimizer {
         m_committedVars          = m_linesearchVars;
 
         // Save the committed factorization in the stash
-        m_equilibriumSolver->solver.stashFactorization();
+        m_equilibriumSolver->solver().stashFactorization();
     }
 
     Real energy(EnergyType etype = EnergyType::Full) const {
@@ -508,8 +512,8 @@ struct ReducedSheetOptimizer {
     // the last committed (known good) state.
     // Also, the *un-normalized* design variables are serialized.
     ////////////////////////////////////////////////////////////////////////////
-    using StateBackwardsCompat = std::tuple<std::shared_ptr<TargetAttractedInflation>, std::shared_ptr<CB>, std::shared_ptr<FusingCurveSmoothness>, std::shared_ptr<WPI>, std::vector<size_t>, VXd, VXd, NewtonOptimizerOptions, bool>; // Before CompressionPenalty was added
-    using State                = std::tuple<std::shared_ptr<TargetAttractedInflation>, std::shared_ptr<CB>, std::shared_ptr<FusingCurveSmoothness>, std::shared_ptr<WPI>, std::vector<size_t>, VXd, VXd, NewtonOptimizerOptions, bool, std::shared_ptr<CompressionPenalty>, Real>; // Before CompressionPenalty was added
+    using StateBackwardsCompat = std::tuple<std::shared_ptr<TargetAttractedInflation>, std::shared_ptr<CB>, std::shared_ptr<FusingCurveSmoothness>, std::shared_ptr<WPI>, std::vector<size_t>, VXd, VXd, NewtonOptimizerOptions, bool>; // Before CompressionPenalty and hessian shift was added
+    using State                = std::tuple<std::shared_ptr<TargetAttractedInflation>, std::shared_ptr<CB>, std::shared_ptr<FusingCurveSmoothness>, std::shared_ptr<WPI>, std::vector<size_t>, VXd, VXd, NewtonOptimizerOptions, bool, std::shared_ptr<CompressionPenalty>, Real, Real>; 
     static State serialize(const ReducedSheetOptimizer &rso) {
         return std::make_tuple(rso.m_targetAttractedInflation, rso.m_collapseBarrier, rso.m_smoothness, rso.m_wallPosInterp,
                                rso.fixedEquilibriumVars(),
@@ -518,7 +522,8 @@ struct ReducedSheetOptimizer {
                                rso.m_equilibriumSolver->options,
                                rso.useFirstOrderPrediction,
                                rso.m_compressionPenalty,
-                               rso.compressionPenaltyWeight);
+                               rso.compressionPenaltyWeight, 
+                               rso.hessian_shift);
     }
 
     static std::unique_ptr<ReducedSheetOptimizer> deserialize(const StateBackwardsCompat &state, std::shared_ptr<CompressionPenalty> cp = nullptr) {
@@ -549,7 +554,7 @@ struct ReducedSheetOptimizer {
         tai.setVars(committedEq); // Roll back sheet to committed equilibrium (in case it was pickled in a linesearch state)
 
         // Set up equilibrium solver
-        rso->m_equilibriumSolver = get_inflation_optimizer(*(rso->m_targetAttractedInflation), fv, eopts);
+        rso->m_equilibriumSolver = get_inflation_optimizer(*(rso->m_targetAttractedInflation), fv, eopts, nullptr, rso->hessian_shift);
 
         // Initialize remaining state
         rso->m_linesearchVars = VXd::Zero(committedVars.size()); // needed for setVars to detect a "new" equilibrium
@@ -562,10 +567,11 @@ struct ReducedSheetOptimizer {
     static std::unique_ptr<ReducedSheetOptimizer> deserialize(const State &state) {
         auto rso = deserialize(std::make_tuple(std::get<0>(state), std::get<1>(state), std::get<2>(state), std::get<3>(state), std::get<4>(state), std::get<5>(state), std::get<6>(state), std::get<7>(state), std::get<8>(state)), std::get<9>(state));
         rso->compressionPenaltyWeight = std::get<10>(state);
+        rso->hessian_shift            = std::get<11>(state);
         return rso;
     }
 
-    std::unique_ptr<ReducedSheetOptimizer> cloneForNewTAIAndFixedVars(std::shared_ptr<TargetAttractedInflation> tas, const std::vector<size_t> &fv) const {
+    std::unique_ptr<ReducedSheetOptimizer> cloneForNewTAIAndFixedVars(std::shared_ptr<TargetAttractedInflation> tas, const std::vector<size_t> &fv, Real hessianShift) const {
         // Clone the compression penalty for the new sheet.
         auto cp = std::make_shared<CompressionPenalty>(tas->sheetPtr());
         cp->modulation      = m_compressionPenalty->modulation->clone();
@@ -579,7 +585,8 @@ struct ReducedSheetOptimizer {
                                 m_wallPosInterp->clone(),
                                 fv, m_committedVars, tas->getVars(), m_equilibriumSolver->options, useFirstOrderPrediction, // ordinary values not needing needing cloning
                                 cp,
-                                compressionPenaltyWeight));
+                                compressionPenaltyWeight,
+                                hessianShift));
     }
 
     ////////////////////////////////////////////////////////////////////////////
@@ -587,6 +594,7 @@ struct ReducedSheetOptimizer {
     ////////////////////////////////////////////////////////////////////////////
     bool useFirstOrderPrediction = true;
     Real compressionPenaltyWeight = 0.0;
+    Real hessian_shift = 0.0;
 private:
     ReducedSheetOptimizer() { } // Empty constructor needed for deserialization
 
@@ -603,7 +611,7 @@ private:
     std::unique_ptr<NewtonOptimizer>          m_equilibriumSolver;
 
     void m_updateAdjointState() {
-        auto &solver = m_equilibriumSolver->solver;
+        auto &solver = m_equilibriumSolver->solver();
         ///////////////////////////////////////////////////////////////////////
         // Sensitivity analysis
         ///////////////////////////////////////////////////////////////////////
@@ -620,11 +628,11 @@ private:
         // flexibility to change weights/exclude terms (as allowed by our
         // energy/gradient interface) without calling `m_updateAdjointState`.
         try {
-            Eigen::VectorXd dFit_dx = m_equilibriumSolver->removeFixedEntries(m_targetAttractedInflation->gradUnweightedTargetFit().cast<double>());
-            Eigen::VectorXd dCP_dx  = m_equilibriumSolver->removeFixedEntries(nondimensionalization().equilibriumVarScale() * m_compressionPenalty->dJ_dx().cast<double>());
+            Eigen::VectorXd dFit_dx = m_targetAttractedInflation->gradUnweightedTargetFit().cast<double>();
+            Eigen::VectorXd dCP_dx  = nondimensionalization().equilibriumVarScale() * m_compressionPenalty->dJ_dx().cast<double>();
             // expressed in terms of rescaled variables
-            m_adjointStateFitting            = m_equilibriumSolver->extractFullSolution(solver.solve(dFit_dx)).cast<Real>();
-            m_adjointStateCompressionPenalty = m_equilibriumSolver->extractFullSolution(solver.solve(dCP_dx )).cast<Real>();
+            m_adjointStateFitting            = (solver.solve(dFit_dx)).cast<Real>();
+            m_adjointStateCompressionPenalty = (solver.solve(dCP_dx )).cast<Real>();
         }
         catch (...) {
             std::cerr << "Adjoint state solve failed." << std::endl;

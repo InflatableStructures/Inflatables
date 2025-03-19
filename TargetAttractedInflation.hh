@@ -31,7 +31,7 @@ struct TargetAttractedInflation {
     using M32d = InflatableSheet::M32d;
     using VSFJ = VectorizedShapeFunctionJacobian<3, V2d>;
 
-    TargetAttractedInflation(std::shared_ptr<InflatableSheet> s, const Mesh &targetSurface);
+    TargetAttractedInflation(std::shared_ptr<InflatableSheet> s, const Mesh &targetSurface, const std::vector<bool>& wallVtxOnBoundary = std::vector<bool>());
 
           InflatableSheet &sheet()       { return *m_sheet; }
     const InflatableSheet &sheet() const { return *m_sheet; }
@@ -59,6 +59,9 @@ struct TargetAttractedInflation {
 
     Real energy(EnergyType etype = EnergyType::Full) const;
     VXd  gradient(EnergyType etype = EnergyType::Full) const;
+
+    Real systemEnergy() const { return energy(); }
+
 
     // Gradient of the unweighted target attraction energy
     // for reuse in sensitivity analysis for the target-fitting.
@@ -95,6 +98,19 @@ struct TargetAttractedInflation {
 
     Real fittingWeight = 1.0;
     Nondimensionalization nondimensionalization;
+
+    const std::vector<bool> &wallVtxOnBoundary() const { return m_wallVtxOnBoundary; }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // Visualization
+    ////////////////////////////////////////////////////////////////////////////
+
+    std::shared_ptr<Mesh> visualizationMesh(bool duplicateFusedTris = false) const { 
+    // Visualize (copies of) the periodic unit.
+        return sheet().visualizationMesh(duplicateFusedTris); 
+    }
+
+    Eigen::MatrixXd visualizationField(Eigen::MatrixXd field, bool duplicateFusedTris = false) { return sheet().visualizationField(field, duplicateFusedTris); };
 
 private:
     std::shared_ptr<InflatableSheet>     m_sheet;

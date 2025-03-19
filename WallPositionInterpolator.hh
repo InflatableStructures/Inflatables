@@ -120,7 +120,8 @@ private:
         m_isBoundary = isBoundary;
         m_numWallVertices = nwv;
         Lii.rowColRemoval([&](SuiteSparse_long i) { return m_isBoundary[i]; });
-        m_LiiFactorizer = std::make_unique<CholmodFactorizer>(Lii);
+        m_LiiFactorizer = std::make_unique<CholmodFactorizer>();
+        m_LiiFactorizer->factorize(Lii);
     }
 
     template<class Real2>

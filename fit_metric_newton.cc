@@ -30,7 +30,7 @@ protected:
         result.setIdentity(true);
     }
 
-    virtual void m_iterationCallback(size_t i) override { if (m_customCallback) m_customCallback(i); }
+    virtual bool m_iterationCallback(size_t i) override { if (m_customCallback) m_customCallback(i); return false; }
 
     CallbackFunction m_customCallback;
 
