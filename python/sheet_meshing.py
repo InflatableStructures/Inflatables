@@ -36,7 +36,8 @@ def meshComponents(m, cutEdges):
     dual_edges = [(u, v) for u in range(len(tri_sets))
                          for v in m.trisAdjTri(u)
                          if includeDualEdge(u, v)]
-
+    if (len(dual_edges) == 0):
+        return 1, np.zeros(len(m.triangles()))
     adj = scipy.sparse.coo_matrix((np.ones(len(dual_edges)), np.transpose(dual_edges))).tocsc()
 
     return scipy.sparse.csgraph.connected_components(adj)
@@ -47,7 +48,7 @@ def wallMeshComponents(sheet, distinctTubeComponents = False):
     """
     m = sheet.mesh()
     nt = m.numTris()
-    iwt = np.array([sheet.isWallTri(ti) for ti in range(nt)], dtype=np.bool)
+    iwt = np.array([sheet.isWallTri(ti) for ti in range(nt)], dtype=bool)
     dual_edges = [(u, v) for u in range(nt)
                          for v in m.trisAdjTri(u)
                          if iwt[u] == iwt[v]]
@@ -55,20 +56,20 @@ def wallMeshComponents(sheet, distinctTubeComponents = False):
     numComponents, components = scipy.sparse.csgraph.connected_components(adj)
     wallLabels = components[iwt].copy()
 
-    renumber = np.empty(numComponents, dtype=np.int)
+    renumber = np.empty(numComponents, dtype=np.int64)
     renumber[:] = -1 # This assigns all non-wall triangles the "component" -1
     uniqueWallLabels = np.unique(wallLabels)
     numWallComponents = len(uniqueWallLabels)
-    renumber[uniqueWallLabels] = np.arange(numWallComponents, dtype=np.int)
+    renumber[uniqueWallLabels] = np.arange(numWallComponents, dtype=np.int64)
 
     if distinctTubeComponents:
         uniqueTubeLabels = np.unique(components[~iwt])
-        renumber[uniqueTubeLabels] = -1 - np.arange(len(uniqueTubeLabels), dtype=np.int)
+        renumber[uniqueTubeLabels] = -1 - np.arange(len(uniqueTubeLabels), dtype=np.int64)
 
     components = renumber[components]
     return numWallComponents, components
 
-def remeshWallRegions(m, fuseMarkers, fuseSegments, pointSetLiesInWall, permitWallInteriorVertices = False, pointsLieInHole = None):
+def remeshWallRegions(m, fuseMarkers, fuseSegments, pointSetLiesInWall, permitWallInteriorVertices = False, pointsLieInHole = None, markBoundaryAsWall = True):
     """
     Take an initial mesh of the sheet and determine the connected triangle components
     that correspond to fused regions. Also remesh these regions so as not to have
@@ -110,7 +111,7 @@ def remeshWallRegions(m, fuseMarkers, fuseSegments, pointSetLiesInWall, permitWa
     triCenters = m.vertices()[m.triangles()].mean(axis=1)
 
     numWalls = 0
-    wallLabels = -np.ones(m.numTris(), dtype=np.int)
+    wallLabels = -np.ones(m.numTris(), dtype=np.int64)
     for c in range(ncomponents):
         component_tris = np.flatnonzero(components == c)
         centers = triCenters[component_tris]
@@ -149,7 +150,7 @@ def remeshWallRegions(m, fuseMarkers, fuseSegments, pointSetLiesInWall, permitWa
             wmF = wallMesh.triangles()
             triCenters = wmV[wmF].mean(axis=1)
 
-            keepTri = np.zeros(wallMesh.numTris(), dtype=np.bool)
+            keepTri = np.zeros(wallMesh.numTris(), dtype=bool)
             keptComponents = 0
             for c in range(nc):
                 component_tris = np.flatnonzero(wallMeshComponents == c)
@@ -175,7 +176,8 @@ def remeshWallRegions(m, fuseMarkers, fuseSegments, pointSetLiesInWall, permitWa
         for v in V: vtxSet.add(tuple(v))
 
     rsV = remeshedSheet.vertices()
-    addVertices(wallBoundaryVertices, rsV[remeshedSheet.boundaryVertices()])
+    if (markBoundaryAsWall):
+        addVertices(wallBoundaryVertices, rsV[remeshedSheet.boundaryVertices()])
 
     for wallmesh in meshes[1:]:
         wmV = wallmesh.vertices()
@@ -330,7 +332,7 @@ def meshWallsAndTubes(fusing_V, fusing_E, m, isWallTri, holePoints, tubePoints, 
     # For meshes without finite-thickness wall regions, we are done
     # (and all vertices in fusing_V are wall/wall boundary vertices.)
     if not np.any(isWallTri):
-        isWallVtx = np.array(fuseMarkers, dtype=np.bool)
+        isWallVtx = np.array(fuseMarkers, dtype=bool)
         return mTubes, isWallVtx, isWallVtx
 
     ############################################################################
@@ -377,7 +379,7 @@ def meshWallsAndTubes(fusing_V, fusing_E, m, isWallTri, holePoints, tubePoints, 
 
     # Also include fused vertices marked inside the tube mesh (i.e., those
     # fused by zero-width curves)
-    addVertices(wallBoundaryVertices, mTubes.vertices()[np.array(fuseMarkers, dtype=np.bool)])
+    addVertices(wallBoundaryVertices, mTubes.vertices()[np.array(fuseMarkers, dtype=bool)])
 
     wallVertices = wallVertices | wallBoundaryVertices
 
@@ -429,7 +431,7 @@ def newMeshingAlgorithm(sdfVertices, sdfTris, sdf, customPts, customEdges, triAr
         triCenters = m.vertices()[m.triangles()].mean(axis=1)
     # m.save('without_holes.msh')
 
-    wallLabels = -np.ones(m.numTris(), dtype=np.int) # assign -1 to tubes
+    wallLabels = -np.ones(m.numTris(), dtype=np.int64) # assign -1 to tubes
 
     # Next, pick a point within each air tube
     for c in range(ncomponents):
@@ -527,7 +529,7 @@ def forward_design_mesh(V, E, fusedPts, holePts, triArea):
     sdf = c
     fs = field_sampler.FieldSampler(minit)
     if len(fusedPts) > 0:
-        fusedComponents = np.array(np.unique(fs.sample(fusedPts, c)), dtype=np.int)
+        fusedComponents = np.array(np.unique(fs.sample(fusedPts, c)), dtype=np.int64)
         sdf[c == fusedComponents] = -1
 
     return newMeshingAlgorithm(sdfV, sdfF, sdf, V, E, triArea=triArea)
